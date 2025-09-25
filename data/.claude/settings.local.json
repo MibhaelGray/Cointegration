@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/Michael Gray/Documents/Cointegration/**)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
