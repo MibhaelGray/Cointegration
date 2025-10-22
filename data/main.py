@@ -328,43 +328,24 @@ def main():
 
 
 if __name__ == "__main__":
-    # Set to True to enable AI interpretations (requires OPENAI_API_KEY in .env)
-    USE_LLM = True
+    # Import the comprehensive analysis function
+    from cointegration_analysis import comprehensive_cointegration_analysis
 
-    # Define your custom basket
-    my_basket = ["AAPL", "MSFT", "GOOGL", "NVDA", "TSLA"]
+    # Example 1: Analyze a pair of stocks
+    pair_results = comprehensive_cointegration_analysis(
+        tickers=["SNDK", "MU"],
+        period="6mo",
+        window=63,  
+        step_size=21,  # ~1 month
+        use_llm=True
+    )
 
-    # Download 2 years of data (need enough history for rolling windows)
-    print("Downloading data...")
-    data = get_close_price_data(my_basket, period="2y")
-
-    # Run rolling analysis
-    # window=252 = ~1 year of trading days
-    # step_size=21 = ~1 month, so we test cointegration each month
-    
-    print("\nRunning rolling cointegration analysis...")
-    results = rolling_cointegration_analysis(data, window=252, step_size=21)
-
-    # Plot the results
-    plot_rolling_results(results, data.columns.tolist(),
-                        window=252, step_size=21,
-                        save_path=os.path.join(PLOTS_DIR, "my_basket_rolling.png"))
-
-    # Show the results
-    print("\nRolling analysis results:")
-    print(results.head())
-    print(f"\nAverage cointegration rank: {results['coint_rank'].mean():.2f}")
-    print(f"% of time cointegrated: {(results['coint_rank'] > 0).mean() * 100:.1f}%")
-
-    # AI Interpretation
-    if USE_LLM:
-        print("\n" + "=" * 70)
-        print("AI INTERPRETATION:")
-        print("=" * 70)
-        try:
-            interpretation = interpret_rolling_analysis(results, my_basket)
-            print(interpretation)
-        except Exception as e:
-            print(f"Could not generate AI interpretation: {e}")
-            print("Make sure OPENAI_API_KEY is set in your .env file")
+    # Example 2: Analyze a basket of stocks
+    # basket_results = comprehensive_cointegration_analysis(
+    #     tickers=["AAPL", "MSFT", "GOOGL", "NVDA", "TSLA"],
+    #     period="2y",
+    #     window=252,  # 252 trading days = ~1 year
+    #     step_size=21,
+    #     use_llm=True
+    # )
     
