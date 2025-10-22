@@ -12,7 +12,7 @@ Implementation:
 
 Run Johansen cointegration test (det_order=0, k_ar_diff=5) on the most recent year
 Extract the first cointegrating vector (eigenvector with largest eigenvalue)
-Save weights, cointegration rank, and metadata to basket_weights.json
+Save weights
 2. Cointegration Testing ParametersJohansen Test Settings:
 
 det_order = 0: Assumes constant-only deterministic trend (standard for equity baskets)
@@ -41,7 +41,7 @@ Cointegration rank drops to 0 on recent data OR
 Johansen test fails on recent 6-month window
 Action: Stop trading immediately. The long-run equilibrium relationship has dissolved.4. Stability Testing ProtocolTest Window: Most recent 6 months (126 trading days)Rationale:
 
-6 months provides sufficient observations for reliable Johansen testing (~126 data points)
+6. months provides sufficient observations for reliable Johansen testing (~126 data points)
 Recent enough to catch regime changes quickly
 Not so short that temporary volatility triggers false breakdowns
 Process:
