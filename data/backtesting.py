@@ -14,7 +14,8 @@ def backtest_pairs_strategy(
     exit_zscore: float = 0.5,
     stop_loss_zscore: float = 4.0,
     transaction_cost: float = 0.001,
-    initial_capital: float = 100000
+    initial_capital: float = 100000,
+    zscore_window: int = 20
 ) -> Dict:
     """
     Backtest a z-score based pairs trading strategy.
@@ -35,6 +36,8 @@ def backtest_pairs_strategy(
         Transaction cost as percentage (default 0.1% = 0.001)
     initial_capital : float
         Starting capital (default $100,000)
+    zscore_window : int
+        Rolling window for z-score calculation (default 20 days)
 
     Returns:
     --------
@@ -44,10 +47,10 @@ def backtest_pairs_strategy(
     if len(data.columns) != 2:
         raise ValueError("Data must contain exactly 2 stocks")
 
-    # Calculate spread and z-score
+    # Calculate spread and ROLLING z-score (fixes look-ahead bias)
     spread = data.iloc[:, 0] - hedge_ratio * data.iloc[:, 1]
-    spread_mean = spread.mean()
-    spread_std = spread.std()
+    spread_mean = spread.rolling(window=zscore_window).mean()
+    spread_std = spread.rolling(window=zscore_window).std()
     zscore = (spread - spread_mean) / spread_std
 
     # Initialize tracking variables
@@ -62,8 +65,15 @@ def backtest_pairs_strategy(
     price_a = np.exp(data.iloc[:, 0])  # Convert log prices back
     price_b = np.exp(data.iloc[:, 1])
 
-    for i in range(1, len(data)):
+    # Start after zscore_window to avoid NaN values
+    for i in range(zscore_window, len(data)):
         current_zscore = zscore.iloc[i]
+
+        # Skip if z-score is NaN
+        if pd.isna(current_zscore):
+            equity_curve.append(current_capital if position == 0 else equity_curve[-1])
+            continue
+
         prev_zscore = zscore.iloc[i-1]
 
         # Entry logic
@@ -218,7 +228,11 @@ def backtest_pairs_strategy(
 
     # Calculate performance metrics
     trades_df = pd.DataFrame(trades)
-    equity_series = pd.Series(equity_curve, index=data.index)
+
+    # Create equity series with correct indexing
+    # Equity curve starts from zscore_window (skipping NaN period)
+    equity_index = data.index[zscore_window-1:zscore_window-1+len(equity_curve)]
+    equity_series = pd.Series(equity_curve, index=equity_index)
 
     metrics = calculate_performance_metrics(
         trades_df, equity_series, initial_capital, len(data)
@@ -409,6 +423,264 @@ def optimize_parameters(
     return pd.DataFrame(results).sort_values('sharpe_ratio', ascending=False)
 
 
+def walk_forward_backtest(
+    data: pd.DataFrame,
+    train_window: int = 252,
+    test_window: int = 63,
+    step_size: int = 21,
+    entry_zscore: float = 2.0,
+    exit_zscore: float = 0.5,
+    stop_loss_zscore: float = 4.0,
+    transaction_cost: float = 0.001,
+    initial_capital: float = 100000,
+    zscore_window: int = 20
+) -> Dict:
+    """
+    Walk-forward backtesting with rolling parameter estimation.
+
+    This method prevents look-ahead bias by:
+    - Training on past data only
+    - Testing on future unseen data
+    - Re-calibrating parameters regularly
+
+    Parameters:
+    -----------
+    data : pd.DataFrame
+        Price data with exactly 2 columns (log prices)
+    train_window : int
+        Training window size in days (default 252 = 1 year)
+    test_window : int
+        Testing window size in days (default 63 = ~3 months)
+    step_size : int
+        Days to roll forward (default 21 = ~1 month)
+    entry_zscore : float
+        Z-score threshold for entering positions
+    exit_zscore : float
+        Z-score threshold for exiting positions
+    stop_loss_zscore : float
+        Z-score threshold for stop loss
+    transaction_cost : float
+        Transaction cost as percentage
+    initial_capital : float
+        Starting capital
+    zscore_window : int
+        Rolling window for z-score calculation
+
+    Returns:
+    --------
+    dict
+        Walk-forward backtest results with parameter stability metrics
+    """
+    if len(data.columns) != 2:
+        raise ValueError("Data must contain exactly 2 stocks")
+
+    all_trades = []
+    equity_curve = [initial_capital]
+    current_capital = initial_capital
+    parameters_over_time = []
+
+    print(f"\nWalk-Forward Backtest Configuration:")
+    print(f"  Training window: {train_window} days")
+    print(f"  Testing window: {test_window} days")
+    print(f"  Step size: {step_size} days")
+
+    total_periods = (len(data) - train_window) // step_size
+    print(f"  Total periods: {total_periods}\n")
+
+    period_num = 0
+
+    # Iterate through time
+    for i in range(train_window, len(data) - test_window + 1, step_size):
+        period_num += 1
+
+        # Define windows
+        train_start = i - train_window
+        train_end = i
+        test_start = i
+        test_end = min(i + test_window, len(data))
+
+        train_data = data.iloc[train_start:train_end]
+        test_data = data.iloc[test_start:test_end]
+
+        try:
+            # TRAIN: Estimate hedge ratio from training window only
+            hedge_ratio = np.polyfit(
+                train_data.iloc[:, 1],
+                train_data.iloc[:, 0],
+                1
+            )[0]
+
+            # Store parameters
+            parameters_over_time.append({
+                'period': period_num,
+                'train_start': data.index[train_start],
+                'train_end': data.index[train_end - 1],
+                'test_start': data.index[test_start],
+                'test_end': data.index[test_end - 1],
+                'hedge_ratio': hedge_ratio
+            })
+
+            # TEST: Run backtest on test window with trained parameters
+            window_result = backtest_pairs_strategy(
+                test_data,
+                hedge_ratio=hedge_ratio,
+                entry_zscore=entry_zscore,
+                exit_zscore=exit_zscore,
+                stop_loss_zscore=stop_loss_zscore,
+                transaction_cost=transaction_cost,
+                initial_capital=current_capital,
+                zscore_window=zscore_window
+            )
+
+            # Update capital based on this period's results
+            if len(window_result['trades']) > 0:
+                completed_trades = window_result['trades'][window_result['trades']['net_pnl'].notna()]
+                for _, trade in completed_trades.iterrows():
+                    all_trades.append(trade.to_dict())
+
+                current_capital = window_result['equity_curve'].iloc[-1]
+
+            # Extend equity curve
+            if len(equity_curve) > 0:
+                equity_curve.extend(window_result['equity_curve'].iloc[1:].tolist())
+            else:
+                equity_curve.extend(window_result['equity_curve'].tolist())
+
+            print(f"Period {period_num}/{total_periods}: {data.index[test_start]} to {data.index[test_end-1]}")
+            print(f"  Hedge ratio: {hedge_ratio:.4f}, Trades: {len(window_result['trades'])}, "
+                  f"Capital: ${current_capital:,.0f}")
+
+        except Exception as e:
+            print(f"  Error in period {period_num}: {e}")
+            continue
+
+    # Calculate final metrics
+    trades_df = pd.DataFrame(all_trades) if all_trades else pd.DataFrame()
+    equity_series = pd.Series(equity_curve, index=data.index[:len(equity_curve)])
+
+    metrics = calculate_performance_metrics(
+        trades_df, equity_series, initial_capital, len(data)
+    )
+
+    # Add parameter stability metrics
+    params_df = pd.DataFrame(parameters_over_time)
+    if len(params_df) > 0:
+        metrics['parameter_stability'] = {
+            'hedge_ratio_mean': params_df['hedge_ratio'].mean(),
+            'hedge_ratio_std': params_df['hedge_ratio'].std(),
+            'hedge_ratio_cv': params_df['hedge_ratio'].std() / abs(params_df['hedge_ratio'].mean()),
+            'hedge_ratio_range': (params_df['hedge_ratio'].min(), params_df['hedge_ratio'].max())
+        }
+
+    return {
+        'trades': trades_df,
+        'equity_curve': equity_series,
+        'metrics': metrics,
+        'parameters_over_time': params_df,
+        'method': 'walk_forward',
+        'configuration': {
+            'train_window': train_window,
+            'test_window': test_window,
+            'step_size': step_size,
+            'entry_zscore': entry_zscore,
+            'exit_zscore': exit_zscore,
+            'stop_loss_zscore': stop_loss_zscore,
+            'transaction_cost': transaction_cost,
+            'initial_capital': initial_capital,
+            'zscore_window': zscore_window
+        }
+    }
+
+
+def backtest_with_train_test_split(
+    data: pd.DataFrame,
+    train_pct: float = 0.6,
+    entry_zscore: float = 2.0,
+    exit_zscore: float = 0.5,
+    stop_loss_zscore: float = 4.0,
+    transaction_cost: float = 0.001,
+    initial_capital: float = 100000,
+    zscore_window: int = 20
+) -> Dict:
+    """
+    Backtest with simple train/test split.
+
+    Parameters learned on training data, tested on hold-out test data.
+
+    Parameters:
+    -----------
+    data : pd.DataFrame
+        Price data with exactly 2 columns (log prices)
+    train_pct : float
+        Percentage of data to use for training (default 0.6 = 60%)
+    entry_zscore : float
+        Z-score threshold for entering positions
+    exit_zscore : float
+        Z-score threshold for exiting positions
+    stop_loss_zscore : float
+        Z-score threshold for stop loss
+    transaction_cost : float
+        Transaction cost as percentage
+    initial_capital : float
+        Starting capital
+    zscore_window : int
+        Rolling window for z-score calculation
+
+    Returns:
+    --------
+    dict
+        Train/test split backtest results
+    """
+    if len(data.columns) != 2:
+        raise ValueError("Data must contain exactly 2 stocks")
+
+    # Split data
+    split_idx = int(len(data) * train_pct)
+    train_data = data.iloc[:split_idx]
+    test_data = data.iloc[split_idx:]
+
+    print(f"\nTrain/Test Split Backtest:")
+    print(f"  Training period: {train_data.index[0]} to {train_data.index[-1]} ({len(train_data)} days)")
+    print(f"  Testing period: {test_data.index[0]} to {test_data.index[-1]} ({len(test_data)} days)")
+
+    # TRAINING: Calculate hedge ratio from training data only
+    hedge_ratio = np.polyfit(train_data.iloc[:, 1], train_data.iloc[:, 0], 1)[0]
+
+    print(f"\nParameters learned from training:")
+    print(f"  Hedge ratio: {hedge_ratio:.4f}")
+
+    # TESTING: Run backtest on test data with trained parameters
+    test_results = backtest_pairs_strategy(
+        test_data,
+        hedge_ratio=hedge_ratio,
+        entry_zscore=entry_zscore,
+        exit_zscore=exit_zscore,
+        stop_loss_zscore=stop_loss_zscore,
+        transaction_cost=transaction_cost,
+        initial_capital=initial_capital,
+        zscore_window=zscore_window
+    )
+
+    return {
+        'train_period': (train_data.index[0], train_data.index[-1]),
+        'test_period': (test_data.index[0], test_data.index[-1]),
+        'train_data': train_data,
+        'test_data': test_data,
+        'hedge_ratio': hedge_ratio,
+        'test_results': test_results,
+        'method': 'train_test_split',
+        'configuration': {
+            'train_pct': train_pct,
+            'entry_zscore': entry_zscore,
+            'exit_zscore': exit_zscore,
+            'stop_loss_zscore': stop_loss_zscore,
+            'transaction_cost': transaction_cost,
+            'initial_capital': initial_capital,
+            'zscore_window': zscore_window
+        }
+    }
+
+
 def print_backtest_summary(backtest_results: Dict):
     """
     Print a formatted summary of backtest results.
@@ -416,22 +688,70 @@ def print_backtest_summary(backtest_results: Dict):
     Parameters:
     -----------
     backtest_results : dict
-        Results from backtest_pairs_strategy
+        Results from backtest_pairs_strategy, walk_forward_backtest, or backtest_with_train_test_split
     """
-    metrics = backtest_results['metrics']
-    params = backtest_results['parameters']
+    # Handle different result formats
+    if 'method' in backtest_results:
+        method = backtest_results['method']
+        if method == 'walk_forward':
+            metrics = backtest_results['metrics']
+            config = backtest_results['configuration']
 
-    print("\n" + "=" * 70)
-    print("BACKTEST SUMMARY")
-    print("=" * 70)
+            print("\n" + "=" * 70)
+            print("WALK-FORWARD BACKTEST SUMMARY")
+            print("=" * 70)
 
-    print("\nSTRATEGY PARAMETERS:")
-    print(f"  Entry Z-score Threshold: ±{params['entry_zscore']:.1f}")
-    print(f"  Exit Z-score Threshold: ±{params['exit_zscore']:.1f}")
-    print(f"  Stop Loss Z-score: ±{params['stop_loss_zscore']:.1f}")
-    print(f"  Hedge Ratio: {params['hedge_ratio']:.4f}")
-    print(f"  Transaction Cost: {params['transaction_cost']*100:.2f}%")
-    print(f"  Initial Capital: ${params['initial_capital']:,.0f}")
+            print("\nCONFIGURATION:")
+            print(f"  Training window: {config['train_window']} days")
+            print(f"  Testing window: {config['test_window']} days")
+            print(f"  Step size: {config['step_size']} days")
+            print(f"  Entry Z-score: ±{config['entry_zscore']:.1f}")
+            print(f"  Exit Z-score: ±{config['exit_zscore']:.1f}")
+            print(f"  Stop Loss Z-score: ±{config['stop_loss_zscore']:.1f}")
+            print(f"  Transaction Cost: {config['transaction_cost']*100:.2f}%")
+            print(f"  Initial Capital: ${config['initial_capital']:,.0f}")
+
+            if 'parameter_stability' in metrics:
+                print("\nPARAMETER STABILITY:")
+                ps = metrics['parameter_stability']
+                print(f"  Hedge Ratio Mean: {ps['hedge_ratio_mean']:.4f}")
+                print(f"  Hedge Ratio Std: {ps['hedge_ratio_std']:.4f}")
+                print(f"  Hedge Ratio CV: {ps['hedge_ratio_cv']*100:.2f}%")
+                print(f"  Hedge Ratio Range: [{ps['hedge_ratio_range'][0]:.4f}, {ps['hedge_ratio_range'][1]:.4f}]")
+
+        elif method == 'train_test_split':
+            metrics = backtest_results['test_results']['metrics']
+            config = backtest_results['configuration']
+
+            print("\n" + "=" * 70)
+            print("TRAIN/TEST SPLIT BACKTEST SUMMARY")
+            print("=" * 70)
+
+            print("\nCONFIGURATION:")
+            print(f"  Train Period: {backtest_results['train_period'][0]} to {backtest_results['train_period'][1]}")
+            print(f"  Test Period: {backtest_results['test_period'][0]} to {backtest_results['test_period'][1]}")
+            print(f"  Hedge Ratio (from training): {backtest_results['hedge_ratio']:.4f}")
+            print(f"  Entry Z-score: ±{config['entry_zscore']:.1f}")
+            print(f"  Exit Z-score: ±{config['exit_zscore']:.1f}")
+            print(f"  Stop Loss Z-score: ±{config['stop_loss_zscore']:.1f}")
+            print(f"  Transaction Cost: {config['transaction_cost']*100:.2f}%")
+            print(f"  Initial Capital: ${config['initial_capital']:,.0f}")
+    else:
+        # Original format
+        metrics = backtest_results['metrics']
+        params = backtest_results['parameters']
+
+        print("\n" + "=" * 70)
+        print("BACKTEST SUMMARY")
+        print("=" * 70)
+
+        print("\nSTRATEGY PARAMETERS:")
+        print(f"  Entry Z-score Threshold: ±{params['entry_zscore']:.1f}")
+        print(f"  Exit Z-score Threshold: ±{params['exit_zscore']:.1f}")
+        print(f"  Stop Loss Z-score: ±{params['stop_loss_zscore']:.1f}")
+        print(f"  Hedge Ratio: {params['hedge_ratio']:.4f}")
+        print(f"  Transaction Cost: {params['transaction_cost']*100:.2f}%")
+        print(f"  Initial Capital: ${params['initial_capital']:,.0f}")
 
     print("\nPERFORMANCE METRICS:")
     print(f"  Total Return: ${metrics['total_return']:,.2f} ({metrics['total_return_pct']:.2f}%)")

@@ -343,7 +343,8 @@ def comprehensive_cointegration_analysis(
     step_size=21,
     use_llm=True,
     save_plots=True,
-    plots_dir="plots"
+    plots_dir="plots",
+    backtest_method="walk_forward"
 ):
     """
     Comprehensive cointegration analysis for pairs or baskets.
@@ -372,6 +373,8 @@ def comprehensive_cointegration_analysis(
         Whether to save plots to disk
     plots_dir : str
         Directory to save plots
+    backtest_method : str
+        Backtesting method: "walk_forward", "train_test_split", or "simple" (default "walk_forward")
 
     Returns:
     --------
@@ -403,6 +406,35 @@ def comprehensive_cointegration_analysis(
     print(f"\n[1/{total_steps}] Downloading {period} of price data...")
     data = get_close_price_data(tickers, period=period)
     print(f"  Downloaded {len(data)} days of data")
+
+    # Validate parameters
+    try:
+        from parameter_validator import validate_backtest_parameters, print_validation_results
+
+        # Determine train/test windows for validation
+        train_win = min(252, len(data) // 3) if backtest_method == "walk_forward" else None
+        test_win = min(63, len(data) // 10) if backtest_method == "walk_forward" else None
+
+        validation = validate_backtest_parameters(
+            period=period,
+            data_length=len(data),
+            window=window,
+            step_size=step_size,
+            backtest_method=backtest_method,
+            train_window=train_win,
+            test_window=test_win,
+            zscore_window=20
+        )
+
+        print_validation_results(validation)
+
+        if not validation['valid']:
+            print("\n[ERROR] Invalid parameter configuration - cannot proceed with analysis")
+            print("Run parameter_validator.suggest_parameters() for recommendations")
+            return None
+
+    except ImportError:
+        print("  (Parameter validation skipped - parameter_validator.py not found)")
 
     # Initialize results dictionary
     results = {
@@ -501,32 +533,81 @@ def comprehensive_cointegration_analysis(
     if is_pair:
         print(f"\n[5/6] Running backtest strategy simulation...")
         try:
-            from backtesting import backtest_pairs_strategy, print_backtest_summary
-
-            # Run backtest with default parameters
-            backtest_result = backtest_pairs_strategy(
-                data,
-                hedge_ratio=beta,
-                entry_zscore=2.0,
-                exit_zscore=0.5,
-                stop_loss_zscore=4.0,
-                transaction_cost=0.001,
-                initial_capital=100000
+            from backtesting import (
+                backtest_pairs_strategy,
+                walk_forward_backtest,
+                backtest_with_train_test_split,
+                print_backtest_summary
             )
 
+            # Run backtest based on selected method
+            if backtest_method == "walk_forward":
+                print("  Using walk-forward methodology (most robust)...")
+                backtest_result = walk_forward_backtest(
+                    data,
+                    train_window=min(252, len(data) // 3),  # 1 year or 1/3 of data
+                    test_window=min(63, len(data) // 10),   # 3 months or 1/10 of data
+                    step_size=21,  # Roll forward monthly
+                    entry_zscore=2.0,
+                    exit_zscore=0.5,
+                    stop_loss_zscore=4.0,
+                    transaction_cost=0.001,
+                    initial_capital=100000,
+                    zscore_window=20
+                )
+            elif backtest_method == "train_test_split":
+                print("  Using train/test split methodology...")
+                backtest_result = backtest_with_train_test_split(
+                    data,
+                    train_pct=0.6,
+                    entry_zscore=2.0,
+                    exit_zscore=0.5,
+                    stop_loss_zscore=4.0,
+                    transaction_cost=0.001,
+                    initial_capital=100000,
+                    zscore_window=20
+                )
+            else:  # simple
+                print("  Using simple backtest (WARNING: may have look-ahead bias if used incorrectly)...")
+                backtest_result = backtest_pairs_strategy(
+                    data,
+                    hedge_ratio=beta,
+                    entry_zscore=2.0,
+                    exit_zscore=0.5,
+                    stop_loss_zscore=4.0,
+                    transaction_cost=0.001,
+                    initial_capital=100000,
+                    zscore_window=20
+                )
+
             results['backtest'] = backtest_result
+            results['backtest_method'] = backtest_method
 
             # Print summary
             print_backtest_summary(backtest_result)
 
             # Optionally save trades to CSV
             if save_plots:
-                trades_path = os.path.join(plots_dir, f"{'_'.join(tickers)}_backtest_trades.csv")
-                backtest_result['trades'].to_csv(trades_path, index=False)
-                print(f"\n  Saved backtest trades to {trades_path}")
+                # Handle different result formats
+                if 'method' in backtest_result:
+                    trades_df = backtest_result['trades']
+                    if backtest_method == "walk_forward":
+                        params_df = backtest_result['parameters_over_time']
+                        params_path = os.path.join(plots_dir, f"{'_'.join(tickers)}_walkforward_parameters.csv")
+                        params_df.to_csv(params_path, index=False)
+                        print(f"\n  Saved parameter evolution to {params_path}")
+                elif 'trades' in backtest_result:
+                    trades_df = backtest_result['trades']
+
+                if len(trades_df) > 0:
+                    trades_path = os.path.join(plots_dir, f"{'_'.join(tickers)}_backtest_trades.csv")
+                    trades_df.to_csv(trades_path, index=False)
+                    print(f"  Saved backtest trades to {trades_path}")
 
         except Exception as e:
             print(f"  ⚠ Could not run backtest: {e}")
+            import traceback
+            traceback.print_exc()
             results['backtest'] = None
     else:
         results['backtest'] = None
